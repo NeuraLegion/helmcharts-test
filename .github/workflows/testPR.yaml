@@ -6,9 +6,20 @@ on:
     - cron: '0 0 * * *'
   # Manual trigger option
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to check (main or unstable)'
+        required: true
+        default: 'main'
+        type: choice
+        options:
+          - main
+          - unstable
 
 jobs:
   update-image-tag:
+    # Only run on main or unstable branch, or when manually triggered
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/unstable' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,45 +28,83 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          # If manually triggered, use specified branch, otherwise use the current branch
+          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Determine branch and tag prefix
         id: branch-check
         run: |
-          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            BRANCH_NAME="${{ github.event.inputs.branch }}"
+          else
+            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          fi
+          
           echo "branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
           
           if [[ "$BRANCH_NAME" == "main" ]]; then
             echo "tag_prefix=stable-" >> $GITHUB_OUTPUT
-          else
+          elif [[ "$BRANCH_NAME" == "unstable" ]]; then
             echo "tag_prefix=unstable-" >> $GITHUB_OUTPUT
+          else
+            echo "Unsupported branch: $BRANCH_NAME"
+            exit 1
           fi
+          
+          echo "Running on branch: $BRANCH_NAME, using tag prefix: $(if [[ "$BRANCH_NAME" == "main" ]]; then echo "stable-"; else echo "unstable-"; fi)"
 
-      - name: Check for new Docker image tags
+      - name: Check for new Docker image tags with pagination
         id: check-tags
         run: |
           # Docker repository for BrokenCrystals
           DOCKER_REPO="brightsec/brokencrystals"
           TAG_PREFIX="${{ steps.branch-check.outputs.tag_prefix }}"
           
-          echo "Checking for new tags with prefix: $TAG_PREFIX"
+          echo "=== FETCHING ALL TAGS FOR $DOCKER_REPO WITH PREFIX $TAG_PREFIX ==="
           
-          # Get latest tag with the appropriate prefix
-          LATEST_TAG=$(curl -s "https://hub.docker.com/v2/repositories/${DOCKER_REPO}/tags?page_size=100" | \
-            jq -r '.results[].name' | \
-            grep "^${TAG_PREFIX}" | \
-            sort -V | \
-            tail -n1)
+          # Initialize variables
+          NEXT_URL="https://hub.docker.com/v2/repositories/${DOCKER_REPO}/tags?page_size=100"
+          TAGS_FILE="all_tags.txt"
+          > $TAGS_FILE  # Create empty file
           
-          echo "Latest tag found: $LATEST_TAG"
+          # Paginate through all results
+          while [ -n "$NEXT_URL" ]; do
+            echo "Fetching page: $NEXT_URL"
+            PAGE_DATA=$(curl -s "$NEXT_URL")
+            
+            # Extract tags matching our prefix and add to file
+            echo "$PAGE_DATA" | jq -r '.results[].name' | grep "^${TAG_PREFIX}" >> $TAGS_FILE || true
+            
+            # Get next page URL or empty string if no more pages
+            NEXT_URL=$(echo "$PAGE_DATA" | jq -r '.next // empty')
+          done
+          
+          # Check if we found any tags
+          if [ ! -s "$TAGS_FILE" ]; then
+            echo "No tags found with prefix: $TAG_PREFIX"
+            exit 1
+          fi
+          
+          # Sort tags by version and get the latest
+          echo "=== ALL MATCHING TAGS (NEWEST AT BOTTOM) ==="
+          sort -V $TAGS_FILE | tee sorted_tags.txt
+          
+          # Get the latest tag
+          LATEST_TAG=$(tail -n1 sorted_tags.txt)
+          echo "=== LATEST TAG FOUND: $LATEST_TAG ==="
           echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           
           # Check current tag in values.yaml
           CURRENT_TAG=$(grep -A1 "images:" charts/brokencrystals/values.yaml | grep "main:" | awk '{print $2}')
-          echo "Current tag: $CURRENT_TAG"
+          echo "=== CURRENT TAG IN VALUES.YAML: $CURRENT_TAG ==="
           
+          # Compare and determine if update is needed
           if [ "$CURRENT_TAG" != "$LATEST_TAG" ]; then
+            echo "=== UPDATE NEEDED: YES ==="
             echo "update_needed=true" >> $GITHUB_OUTPUT
           else
+            echo "=== UPDATE NEEDED: NO ==="
             echo "update_needed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -64,6 +113,8 @@ jobs:
         run: |
           LATEST_TAG="${{ steps.check-tags.outputs.latest_tag }}"
           BRANCH_NAME="${{ steps.branch-check.outputs.branch }}"
+          
+          echo "Updating values.yaml with new tag: $LATEST_TAG"
           
           # Update the values.yaml file
           sed -i "s/main: .*$/main: $LATEST_TAG/" charts/brokencrystals/values.yaml
