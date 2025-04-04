@@ -1,4 +1,4 @@
-name: Update Docker Image Tags
+name: Update Brokencrystals Image Tags
 
 on:
   schedule:
